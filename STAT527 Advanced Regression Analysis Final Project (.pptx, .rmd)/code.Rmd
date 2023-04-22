@@ -1,0 +1,242 @@
+---
+title: "ATP Tennis Betting Market Efficiency"
+output:
+  pdf_document: default
+  html_document: default
+date: "2022-11-28"
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+rm(list=ls())
+library(skedastic); library(sandwich); library(DescTools); library(lmtest)
+library(data.table); library(ggplot2); library(urca); library(tictoc)
+library(dplyr); library(stringr); library(leaps); library(faraway);
+library(ggpp); library(ggpmisc); library(alr4); library(glmnet); library(caret)
+library(wesanderson)
+```
+
+```{r}
+data <- read.csv("/Users/semyon/Library/Mobile Documents/com~apple~CloudDocs/UIUC/Sem1_f22/ST527/Final Project/atp_matches_0121-0622.csv")
+data <- as.data.table(data[,c("ypd","xrd","xrpd","xagemd","xfrm56d","xmind","crnd","ctnm","cent","cha","dsf")])
+data$dsfG <- as.numeric(data$dsf=="Grass")
+data$dsfC <- as.numeric(data$dsf=="Clay")
+data <- data[,-"dsf"]
+```
+
+# 0. Plots
+
+```{r}
+ggplot(data = data[data$xrpd<=quantile(data$xrpd,0.975) & data$xrpd>=quantile(data$xrpd,0.025),], aes(x=xrpd, y=ypd))+geom_point()+
+  theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = rgb(red=100,green=100,blue=100, maxColorValue = 100)),
+axis.line = element_line(colour = "black"))+ggtitle("Rank Points vs. Win Probabilities (middle 95%)")
+```
+
+```{r}
+ggplot(data = data[data$xrd<=quantile(data$xrd,0.975) & data$xrd>=quantile(data$xrd,0.025),], aes(x=xrd, y=ypd))+geom_point()+
+  theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = rgb(red=100,green=100,blue=100, maxColorValue = 100)),
+axis.line = element_line(colour = "black"))+xlab("Rankings difference")+
+  ylab("Win probability difference")+ggtitle("Rankings (middle 95%) vs. Win Probabilities")
+```
+
+```{r}
+ggplot(data = data[data$crnd!=5.5 & data$ypd<=quantile(data$ypd,0.975) & data$ypd>=quantile(data$ypd,0.025),], aes(x=as.character(crnd), y=ypd, fill=as.character(crnd)))+geom_boxplot()+
+  theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = rgb(red=100,green=100,blue=100, maxColorValue = 100)),
+axis.line = element_line(colour = "black"))+
+  ggtitle("Round number vs. Win Probabilities (middle 95% of prob. diff.)")+
+  xlab("Round")+
+  ylab("Win probability difference")+
+  scale_fill_brewer(palette="GnBu")
+```
+
+# 1. Collinearity check
+
+VIF values:
+
+```{r}
+pred <- data[,-1]
+fullmodel <- lm(ypd~., data = data)
+vif <- VIF(fullmodel)
+vif
+```
+
+VIF plot:
+
+```{r}
+vif <- as.data.frame(vif)
+vif$predictors <- rownames(vif)
+vif <- vif[-c(10,11),]
+vifplot <- ggplot(vif, aes(x=predictors,y=vif))+geom_col(aes(fill=predictors))
+vifplot + theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = rgb(red=100,green=100,blue=100, maxColorValue = 100)),
+axis.line = element_line(colour = "black"))+ggtitle("VIF's of all predictors (non-dummy)")+scale_fill_brewer(palette="GnBu")
+```
+
+Highest correlation between any pair by absolute value:
+
+```{r}
+collin <- c(max(abs(cor(pred)[cor(pred)!=1])),max(vif$vif))
+names(collin) <- c("max_abs_correlation","max_vif")
+collin
+```
+
+# 2. Model Selection
+
+## 2.1. Mallows $C_p$:
+
+```{r}
+mat <- model.matrix(ypd~. -1, data = data)
+y <- data$ypd
+bestmods <- leaps(mat, y, nbest = 1)
+colnames(mat)[bestmods$which[which.min(bestmods$Cp),]==FALSE]
+```
+
+## 2.2. BIC (direct comparison)
+
+```{r}
+n <- nrow(data)
+bestmodsall <- leaps(mat, y, nbest = choose(7,4))
+bestmodseach <- cbind(bestmodsall$Cp, bestmodsall$size)
+BIC <- bestmodseach[,1]+n+(log(n)-2)*(bestmodseach[,2])
+# # add model with just intercept
+# rss0 <- sum(resid(lm(ypd~1, data = data))^2)
+# rss1lin <- sum(resid(lm(ypd~xrd, data = data))^2)
+# sigmahat <- rss1lin/(bestmodseach[1,1]-4+n)
+# BICext <- c(BIC,rss0/sigmahat+n)
+# (which.min(BICext)<=length(BIC))*which.min(BICext)
+colnames(mat)[bestmodsall$which[which.min(BIC),]==FALSE]
+```
+
+## 2.3. BIC (backward elimination)
+
+```{r, results='hide'}
+stepbic <- step(lm(ypd~., data = data), k=log(n), direction = "backward")
+```
+
+```{r}
+formula(stepbic)
+```
+
+## 2.4. LASSO selection
+
+```{r}
+cv_model <- cv.glmnet(mat, y, alpha = 1)
+lambda0 <- cv_model$lambda.min
+lambda0
+lambda1 <- cv_model$lambda.1se
+lambda1
+# plot(cv_model)
+lassolm0 <- glmnet(mat, y, lambda = lambda0, alpha = 1)
+lassolm1 <- glmnet(mat, y, lambda = lambda1, alpha = 1)
+cbind(coef(lassolm0),coef(lassolm1))
+```
+
+Model at this point:
+
+```{r}
+lm0 <- lm(ypd~. -ctnm-dsfG-dsfC,data = data)
+```
+
+# 3. Model diagnostics
+
+Diagnostic plots:
+
+```{r}
+par(mfrow=c(2,2)); plot(lm0)
+```
+
+Presence of outliers - not likely, heteroskedasticity - highly likely
+
+## 3.1. Outliers and influential points
+
+```{r}
+influence <- c(round(max(cooks.distance(lm0)),4), round(max(hatvalues(lm0)),4))
+names(influence) <- c("max_cooks_distance","max_leverage")
+influence
+```
+
+## 3.2. Heteroskedasticity checks
+
+### 3.2.1. Breusch-Pagan test
+
+The test is conducted in 3 steps. The first step is estimating LS model and computing squared residuals. The second step is computing Maximum Likelihood estimate of the error variance from the Step 1 regression, and dividing the residuals by it, calling this new variable $g$. Step 3 is applying OLS again, with $g$ as response variable and the original matrix of regressors as explanatory, and then computing total sum of squares (TSS) and explained sum of squares (RSS). The resulting test statistic is $LM=\frac{1}{2}(TSS-RSS) \sim \chi^2 (p)$ under $H_0$, where $p$ - original number of parameters excluding the intercept.
+
+```{r}
+bptest(lm0)[[4]]
+```
+
+### 3.2.2. White test
+
+This test is also conducted in 3 steps. Step 1 is estimating LS model and computing squared residuals (the same as in Breusch-Pagan). Step 2 is regressing the obtained squared residuals on the explanatory variables, their squares and their cross-products, omitting any duplicative variables (for example, if there is a dummy variable, then its square coincides with the dummy variable, and it is duplicative). The result is White auxiliary equation. Some variables and cross products may be skipped if there is perfect collinearity or insufficiency of the number of degrees of freedom. Step 3 is testing the equation for joint significance using a standard F-test for joint significance or alternatively a $\chi^2$ test. $\chi^2_{st}=n\cdot R^2_\text{wh}\sim \chi^2 (p_\text{wh})$, where subscript wh indicates that something relates to White auxilary equation.
+
+```{r}
+white_lm(lm0)
+```
+
+
+# 4. Coefficient tests:
+
+## 4.1. t-tests for individual significance using robust standard errors
+
+```{r}
+coeftest(lm0, vcov = vcovHC(lm0, type = "HC0"))
+```
+
+## 4.2. Wald test for joint significance
+
+```{r}
+lmintercept <- lm(ypd~1,data = data)
+waldtest(lm0,lmintercept, vcov = vcovHC(lm0, type = "HC0"))
+```
+
+# 5. Cross validation
+
+## 5.1. Leave-one-out cross validation (loocv)
+
+```{r}
+# ctrl <- trainControl(method = "LOOCV")
+# model <- train(formula(lm0), data = data, method = "lm", trControl = ctrl)
+# print(model)
+# round(as.matrix(model$results[,c(2,4)]),4)
+```
+
+## 5.2. 10-fold cross validation
+
+```{r, results='hide'}
+# step(lm0, k=log(n), direction = "backward")
+# lm1 <- lm(ypd ~. - ctnm - dsfG - dsfC - xagemd, data)
+# step(lm1, k=log(n), direction = "backward")
+# lm2 <- lm(ypd ~. - ctnm - dsfG - dsfC - xagemd - cent, data)
+# step(lm2, k=log(n), direction = "backward")
+```
+
+```{r}
+set.seed(123)
+ctrl10 <- trainControl(method = "cv", number = 10)
+model10 <- train(formula(lm0), data = data, method = "lm", trControl = ctrl10)
+# model10_2 <- train(formula(lm2), data = data, method = "lm", trControl = ctrl10)
+round(as.matrix(model10$results[c(2,4)]),4)
+# round(as.matrix(model10_2$results[c(2,4)]),4)
+```
+
+```{r}
+# densityPlot(data$ypd)
+# quantile(data$ypd,0.975)-quantile(data$ypd,0.025)
+```
+
+
+
+
+
