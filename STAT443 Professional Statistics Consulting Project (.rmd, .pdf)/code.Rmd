@@ -1,0 +1,883 @@
+---
+title: "STAT443-Final Report"
+author: "Keyu Chen, Ilia Lomasov, Brianna Suits, Nicholas Choi"
+# date: "2022/12/7"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.dim = c(6, 3))
+library(data.table)
+library(ggplot2)
+library(tidyverse)
+library(lmtest)
+library(leaps)
+library(faraway)
+library(psych)
+library(glmnet)
+library(lars)
+library(skedastic)
+library(sandwich)
+library(DescTools)
+library(urca)
+library(olsrr)
+library(MASS)
+library(glmnet)
+library(caret)
+library(corrplot)
+library(knitr)
+data <- as.data.table(read.csv("/Users/semyon/Library/Mobile Documents/com~apple~CloudDocs/UIUC/Sem1/ST443/Consulting project/Group1Data.csv"))
+datamid <- data |>
+  filter(TEY <= 136 & TEY >= 130)
+```
+
+Before starting the report, we would like to point out that we tried to put as much technical stuff into appendix as we could, so that the report is as easy to read as possible. However, some of the terminology should be present in the main part for demonstration and explanation purposes. We will be more than glad to clarify what is not very understandable, so please feel free to write to us anytime. Our team worked organically and the contribution of each member was important.
+
+# Context
+
+By request of our client, a we conducted a study that tried to empirically search for parameters, varying which would reduce the emissions of nitrogen oxides, and not reduce the energy yield. The objectives were, however, not only to search for relationships of different parameters with energy yields and emissions, but also to develop a model that would balance the three main aspects:
+
+ - Simplicity of the model (for engineers to implement)
+ - Accuracy of influence of features on emissions
+ - Explanatory and prediction power of the whole model
+ 
+The data that was given to us contains 36733 instances of 11 sensor measures aggregated over one hour (by means of average or sum). Full description of the variables, their units of measurement and some of the descriptive statistics are presented below:
+
+![Data](/Users/semyon/Library/Mobile Documents/com~apple~CloudDocs/UIUC/Sem1/ST443/Consulting project/data.png "Data")
+
+The data was split into 4 parts on client's request: low ($TEY<130 \text{ [MWH]}$), mid-range or typical ($130\leq TEY \leq 136$), upper mid-range ($136<TEY<160$) and high ($TEY\geq 160$), and a model was developed for each level separately. Running ahead, we did not form any kind of model that would describe the whole dataset, as on any range of **TEY** it would be less accurate than the best models found for those specific ranges.Furthermore, we examined the structure of the data for the upper mid-range and high range and found them very similar, which allowed us to combine them into a single category which we called high ($TEY\geq 136$).
+Below is the plot that shows how many observations are in each group - significant percentage of data is within a small interval of $130\leq TEY \leq 136$.
+
+```{r}
+#data distribution
+datalow1 <- data |>
+  filter(TEY < 130) %>%
+  mutate(level = "Low(<130)")
+
+datahigh1 = data %>%
+  filter(TEY > 136) %>%
+  mutate(level = "High(>136)")
+
+datamid1 <- data |>
+  filter(TEY <= 136 & TEY >= 130) %>%
+  mutate(level = "Mid-range(130-136)")
+data_combined  = rbind(datalow1, datamid1,datahigh1)
+
+
+data_combined |>
+  dplyr::select(TEY, NOX, level) %>%
+  group_by(level) %>%
+  count() %>%
+  ggplot(aes(x=level,y= n,group = level,colour = level, fill = level)) +
+  scale_color_manual(values=c("#d73027", "#fc8d59", "#4575b4"))+
+  scale_fill_manual(values=c("#d73027", "#fc8d59", "#4575b4"))+
+  #scale_color_brewer(palette="RdYlBu") +
+  geom_col() +
+  geom_text(aes(y = n, label = paste(format("n = ", nsmall = 2),n)), vjust = 1.5, colour = "Black") +
+  ggtitle("Distribution of Energy Levels") +
+  ylab("number of observations")+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+And below is a plot that shows how different the structure of **NOX** in relation to **TEY** is for different levels of **TEY**.
+
+```{r}
+yscale <- c(100, 130, 136, 160)
+data_combined %>%
+  dplyr::select(TEY, NOX, level) %>%
+  group_by(level) %>%
+  ggplot() +
+  scale_color_manual(values=c("#d73027", "#fc8d59", "#4575b4"))+
+  #scale_color_brewer(palette="RdYlBu") +
+  geom_point(aes(x=NOX,y=TEY,group = level,colour = level)) +
+  ggtitle("Emission of NOx vs. Energy Levels") +
+  geom_hline(yintercept = 130, linetype = "dotted") +
+  geom_hline(yintercept = 136, linetype = "dotted") +
+  scale_y_continuous(labels=as.character(yscale), breaks = yscale) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+# 1. Mid-range data
+
+This part is focused on the mid-range levels of Turbine energy yield. The algorithms for low, mid-range and high energy yields are very similar, however, as we already demonstrated, the structure of data are different in those four categories of **TEY**.
+
+We start with the mid-range data, which was the main focus of the project since the very beginning.
+
+## 1.1. Choice of response variable for our analysis
+
+The regression model is used to describe individual effects of a chosen set of explanatory variables on a single response variable. [Appendix p.1]
+
+In the model that is constructed, the interpretation of any coefficient [notated $b_j$] of an explanatory variable is as follows. Keeping all other explanatory variables fixed, an increase/decrease in an explanatory variable by 1 unit of its measurement results on average in an increase/decrease of response variable by $b_j$ units of its measurement. For example,
+$$NOX=1+2\cdot AT-3\cdot TEY$$ means that if we increase **AT** by 1 mbar and keep **TEY** constant, the corresponding increase in **NOX** will be 2 mg/m3. While if we increase **TEY** by 1 MWH and keep **AT** constant, the corresponding decrease in **NOX** will be 3 mg/m3. The former is exactly the scenario that we are looking for.
+ 
+Therefore, in the setup that we have, the choice of **NOX** (Nitrogen Oxides) as a response variable was obvious - by analogy, we try to see how other features might be tweaked in order to decrease emissions (based on their coefficients) while keeping **TEY** constant.
+
+## 1.2. Collinearity detection
+
+Collinearity is high linear interdependence of two or more explanatory variables. It is important to detect it since in its presence the coefficients become inaccurate, and we cannot make any conclusions based on them. Besides, collinearity is very closely related to correlation between those variables. And if two variables are highly correlated then by definition it means that it is very difficult (if not impossible) in practice to vary one of them while keeping the other one fixed.
+
+To formally detect collinearity among the whole set of explanatory variables, we used $VIF$ (Variance Inflation Factor) as a measure and $10$ as a benchmark. [Appendix p.2]
+
+Below are the variables which do not pass the check and their VIF values:
+
+```{r, results='hide'}
+
+mkable <- function(x){
+  knames <- names(x)
+  x <- as.data.table(t(as.matrix(x)))
+  colnames(x) <- knames
+  kable(x)
+}
+```
+
+```{r}
+vif <- VIF(lm(NOX~. -CO,data = datamid))
+vif1 <- vif[which(vif>10)]
+mkable(vif1)
+# INSERT PLOT
+```
+
+And below is the plot of VIF of all variables (with a horizontal line being the benchmark):
+
+```{r, fig.dim=c(6,2.75)}
+vif <- as.data.frame(vif)
+vif$predictors <- rownames(vif)
+vifplot <- ggplot(vif, aes(x=predictors,y=vif))+geom_col(aes(fill=predictors))+geom_abline(intercept = 10, slope=0)
+vifplot + theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = rgb(red=100,green=100,blue=100, maxColorValue = 100)),
+axis.line = element_line(colour = "black"))+
+  ylab("VIF")+
+  ggtitle("VIF's of all predictors")+scale_fill_brewer(palette="RdYlBu")
+```
+
+As we can see, our analysis detected that Ambient temperature (**AT**), Gas turbine exhaust pressure (**GTEP**) and Turbine inlet temperature (**TIT**) are very closely correlated with one another. A plot below presents the numeric values of those correlations:
+
+```{r, fig.dim=c(7.5,3.75)}
+corpred <- cor(datamid[,-c(10,11)])
+
+corrplot(corpred, method = 'number', order = 'AOE', type = 'lower', diag = FALSE, tl.col = 'black',
+         cl.ratio = 0.2, tl.srt = 30, title = "Correlation Plot", mar=c(0,0,1,0), tl.cex = 0.9,number.cex = 0.85, addCoef.col = "Black")
+```
+
+Absolute value of correlation of two variables is the fraction of times they move together. Its sign is the direction in which they move together. If it is positive, they move together in the same direction. If it is negative - the opposite.
+Diagonal entries are always equal to one since variable moves together with itself in the same direction 100% of times. As we can see from the table, **AT** and **GTEP** move together in the same direction $\mathbf{95\%}$ of times, **AT** and **TIT** move together in the same direction $\mathbf{89\%}$ of times, **GTEP** and **TIT** move together in the same direction $\mathbf{92\%}$ of times. In the context of our study, it means that it is nearly impossible to tweak any of those variables keeping other two fixed, and it only makes sense to change them together, looking at their coefficients in the final model.
+
+## 1.3. Linear variable selection, outliers & checking assumptions
+
+The larger the number of variables, the lower the chances that some of the features were not captured by the model. However, when there are just too many variables, overfitting problem arises. Overfitting is making the coefficients too much dependent on the existing sample. It means that if we are given a new sample (for example, a sample that the turbine sensors will collect after implementation of one some of our proposals), the errors in the analysis of this out-of-sample data will be large, because the model is not trained enough to deal with data that is not the same as it was "fed" with. Hence, we need to use a criterion that would penalize the choice of 'too many' features for analysis. For those needs, a statistic called Mallow's $C_p$ was used. [Appendix p.3].
+
+And the variables in model that was chosen using Mallow's $C_p$ is presented below:
+
+[All the variables to the right of "$\sim$" sign are predictors. If the variable is present first with a plus and later with a minus sign, it means that it has been removed from the model.]
+
+```{r}
+matmid <- model.matrix(NOX~. -1-CO, data = datamid)
+nox <- datamid$NOX
+bestmodsmid <- leaps(matmid, nox, nbest = 1)
+bestmodelmid <- lm(NOX~. -CO-CDP,data = datamid)
+formula(bestmodelmid)
+```
+
+Then, detection of outliers should be done. In presence of outliers, the coefficients of the model become inaccurate. To give a simple example, if a member of your 10-people family wins \$1mln in a lottery, while other 9 win nothing, it means that if you estimate average winnings, you get a result of \$1mln/10=\$10000. However, considering 1mln people participate, the lottery winner is just an outlier, and in reality average winnings are just \$1 per person. To formally detect outliers, Cook's distance is used. Here, nothing was detected. [Appendix p.4.1]
+
+Variable selection and estimation of the coefficients is only one part of the modeling process. Some of the coefficients might be insignificant, which means that the corresponding feature does not actually have a big enough impact on the response variable. This in turn means that the previously defined interpretation of those coefficients is invalid. And to accurately test both individual significance of a variable and joint significance of a group of variables, *homoskedasticity* and *normality* assumptions are needed [Appendix p.4.2 and p.4.3 respectively]. In other words, we need it to be 100% sure that we keep all the significant features and get rid of all the insignificant ones. (It does not affect the values of those coefficients, only their significance).
+
+In order to test *homoskedasticity*, Breusch-Pagan and White tests were used. They both presented us with extremely strong statistical evidence that *heteroskedasticity* (opposite of *homoskedasticity*) is present in the linear model.
+
+In order to test *normality*, Shapiro-Wilk test was used. It presented us with extremely strong statistical evidence that the assumption of *normality* is in fact violated by the linear model [Appendix p.4.4]. This test, however, cannot detect *normality* without assuming *homoskedasticity*, which is impossible by obvious reasons. Therefore, we can only use its results for comparison of different models with each other.
+
+## 1.4. Nonlinear variable selection, outliers & checking assumptions
+
+In order to see if power (or log) transformation of the response variable is appropriate, Box-Cox transformation is used [Appendix p.5.1]. And for this data, Box-Cox procedure prescribes to use $\ln($$\texttt{NOX})$ as the new response variable. This is favorable for us too since logarithms are easy to interpret. [formal interpretation is in Appendix p.5.2]
+
+Non-formally, the interpretation is very similar to the one given for linear model (in part 1 of this report) but now the change in the response variable is not unit but percentage change.
+
+```{r}
+datamidnl <- datamid
+datamidnl$NOXnl <- I(log(datamidnl$NOX)) # adding a transformed NOX
+# datamidnl <- datamidnl[-c(886,3545,1930),] # dealing with outliers
+matmidnl <- model.matrix(NOXnl~. -1-CO-NOX, data = datamidnl)
+noxnl <- datamidnl$NOXnl
+bestmodsmidnl <- leaps(matmidnl, noxnl, nbest = 1)
+bestmodelmidnl <- lm(NOXnl~. -CO-CDP-NOX,data = datamidnl)
+```
+
+After the transformation, the same procedure as in the linear case is done with this new model. There is still extremely strong evidence that *heteroskedasticity* is present, and that *normality* assumption is violated. However, as we said earlier, this model performs better in this regards than the previous one. [Appendix p.4.5]. Below is the model at this point: **NOXnl** (or log of **NOX**) as predictor.
+
+```{r}
+formula(bestmodelmidnl)
+```
+
+## 1.5. Reducing the model
+
+The model chosen at the previous step is the best one in terms of describing the given dataset, as well as predicting the levels of emissions given a new sample of turbine sensor measurements. [Appendix p.5.3]. High correlation and multicollinearity, however, causes the coefficients of the model to be inaccurate. And they might still be significant due to the sample size being large and as a result, standard errors being large. Hence it is reasonable to look how much 'worse' the model becomes if 1 or 2 of those 3 variables are removed, using information criteria. Akaike Information Criterion was used for this purpose because it is more consistent with the original criterion used (Mallow's $C_p$). [Appendix p.6.1].
+
+```{r}
+redmodmidnl <- lm(NOXnl~. -CO-CDP-NOX-TIT-GTEP,data = datamidnl)
+redmodmidnl0 <- lm(NOXnl~. -CO-CDP-NOX-TIT,data = datamidnl)
+# 100*(AIC(bestmodelmidnl)-AIC(redmodmidnl))/AIC(bestmodelmidnl) # 
+# 100*(AIC(bestmodelmidnl)-AIC(redmodmidnl0))/AIC(bestmodelmidnl)
+```
+
+As it stands, removing **AT** results in a very large (about $11.05\%$) model worsening. Removing **GTEP** results in a modest (about $1.16\%$) model worsening. Removing **TIT** results in a negligible (about $0.01\%$) model worsening. So, at the first step, **TIT** can be removed with very limited consequences. If after that **GTEP** is removed too, the cumulative worsening becomes about $2.10\%$, which is also acceptable, especially if simplicity of the model is highly valued. Moreover, if **GTEP** is not removed, collinearity in the model remains present, which means that individual coefficients of the model might still be inaccurate (at least more so than if **GTEP** is removed). Also, prediction power of the model as a whole is not a concern of this study, and accuracy of the coefficients is key. So, both **TIT** and **GTEP** are removed from the model at this stage. Model at this point includes the following set of variables:
+
+```{r}
+formula(redmodmidnl)
+```
+
+Moreover, AP and AH, despite not being correlated with the rest of the features, cannot be tweaked. So, we also checked if any/both of those variables can be removed from the model. And Removing AH results in a very large (about $25.01\%$) model worsening. Removing AP results in a modest (about $1.40\%$) model worsening. So, AP was also removed from the model.
+
+&nbsp;
+
+Model at this point:
+
+```{r}
+redmodmidnl1 <- lm(NOXnl~. -CO-CDP-NOX-TIT-GTEP-AP,data = datamidnl)
+formula(redmodmidnl1)
+```
+
+Now, in this model, TAT is not only very small by absolute value but also becomes insignificant, and the model actually improves by about $0.01\%$ (based on the same criteria) if it is removed.
+
+Marginal effect of each variable left in the final model on **NOXnl** is presented below:
+
+```{r}
+redmodmidnl11 <- lm(NOXnl~. -CO-CDP-NOX-TIT-GTEP-AP-TAT,data = datamidnl)
+mkable(round(100*(exp(summary(redmodmidnl11)$coefficients[-1,1])-1),4))
+```
+
+So, the average percentage decrease in **NOX** that is associated with 1 mbar decrease of **AFDP** is approximately $\mathbf{3.00\%}$:
+
+```{r}
+mkable(100*(exp(redmodmidnl11$coefficients)[4]-1))
+```
+
+Which is quite different from $\mathbf{1.63\%}$ that the non-reduced model yielded.
+
+The same procedure (to determine prediction power) was done to this reduced model, and the results suggested that the model has only worsened by $\approx 3.70 \%$ in terms of prediction power. Evidence suggests that on average predicted **NOXnl** differ from the actual ones by only $\approx 4.00\%$, which is a very slight deviation and signalizes to us that the model is still extremely good for predictions. The model was checked for robustness, and it is about as robust as the non-reduced one. [Appendix p.6.3]
+
+# 2. High levels of TEY
+
+This section runs the same analysis that was done for mid-range **TEY**, hence some of the explanations are redundant. Please refer to section 1.
+
+```{r}
+datahigh <- data |>
+  filter(TEY > 136)
+```
+
+## 2.1. Collinearity detection
+
+Below are the variables whose VIF goes beyond the benchmark of 10, and their corresponding VIF's
+
+```{r}
+modhigh <- lm(NOX~.-CO,data = datahigh)
+vif_h <- VIF(modhigh)
+vif_h1 <- vif_h[which(vif_h>10)]
+mkable(vif_h1)
+```
+
+Evidence suggests that **AT**, **GTEP**, **TIT**, **TAT**, **TEY**, and **CDP** are collinear. Below is the plot of their VIF's, with horizontal line at $VIF=10$ being the benchmark:
+
+```{r}
+vif_h <- as.data.frame(vif_h)
+vif_h$predictors <- rownames(vif_h)
+vifplot_h <- ggplot(vif_h, aes(x=predictors,y=vif_h))+geom_col(aes(fill=predictors))+geom_abline(intercept = 10, slope=0)
+vifplot_h + theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = rgb(red=100,green=100,blue=100, maxColorValue = 100)),
+axis.line = element_line(colour = "black"))+
+  ylab("VIF")+
+  ggtitle("VIF's of all predictors")+scale_fill_brewer(palette="RdYlBu")
+```
+
+Here, the steps in finding the best model that are used before are irrelevant since one of the collinear variables is **TEY**. And it is crucial for us to find the model where **TEY** is not correlated with any other variables. So, it is reasonable to start removing other variables from the full model one by one. At each step the variable, removing which hurts the model the least (based on the same criterion as for mid-range), is removed.
+
+```{r, results='hide'}
+step(modhigh,k=2,direction="backward")
+minus1 <- lm(NOX~.-CO-CDP,data = datahigh) #remove CDP
+100*(AIC(modhigh)-AIC(minus1))/AIC(modhigh) #improvement is 0.012%
+
+minus2 <- lm(NOX~.-CO-CDP-AFDP,data = datahigh) #remove AFDP
+100*(AIC(minus1)-AIC(minus2))/AIC(minus1) #worsening is 0.295%
+step(minus2,k=2,direction="backward")
+
+minus3 <- lm(NOX~.-CO-CDP-AFDP-GTEP,data = datahigh) #remove GTEP
+100*(AIC(minus2)-AIC(minus3))/AIC(minus2) #worsening is 0.098%
+step(minus3,k=2,direction="backward")
+
+minus4 <- lm(NOX~.-CO-CDP-AFDP-GTEP-TAT,data = datahigh) #remove TAT
+100*(AIC(minus3)-AIC(minus4))/AIC(minus3) #worsening is 0.028%
+step(minus4,k=2,direction="backward")
+
+minus5 <- lm(NOX~.-CO-CDP-AFDP-GTEP-TAT-AH,data = datahigh) #remove AH
+100*(AIC(minus4)-AIC(minus5))/AIC(minus4) #worsening is 2.869%, sigificant
+```
+
+At the 1st step, removing **CDP** improves the model by $\approx 0.012\%$, so, **CDP** is removed. At the 2nd step, there are no more variables, removal of which improves the model. Eliminating **ADFP** results in the least worsening though, namely $0.295\%$. At the 3rd step, eliminating **GTEP** results in the least worsening, $0.098\%$, hence, it is removed. At the 4th step, eliminating **TAT** results in the least worsening, $0.028\%$, hence, it is removed. At the 5th step, **TIT** is the only variable left that could be tweaked in order to reduce **NOX**. Among others, the least "important" variable is **AH**, and removing it results in a pretty significant worsening of $2.869\%$. Moreover, at this point collinearity is gone:
+
+```{r, fig.dim=c(4,3)}
+vif_h1 <- VIF(minus4)
+vif_h1 <- as.data.frame(vif_h1)
+vif_h1$predictors <- rownames(vif_h1)
+vifplot_h1 <- ggplot(vif_h1, aes(x=predictors,y=vif_h1))+geom_col(aes(fill=predictors))+geom_abline(intercept = 10, slope=0)
+vifplot_h1 + theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = rgb(red=100,green=100,blue=100, maxColorValue = 100)),
+axis.line = element_line(colour = "black"))+
+  ylab("VIF")+
+  ggtitle("VIF's of all predictors")+scale_fill_brewer(palette="RdYlBu")
+```
+
+Hence, the model that is chosen for the high-range **TEY** is:
+
+```{r}
+formula(minus4)
+```
+
+And marginal effects of each variable on **NOX** is:
+
+```{r}
+mkable(round(coef(minus4)[-c(1,6)],4))
+```
+
+Which means that keeping **TEY** fixed, a decrease of **TIT** by 1ºC is associated with an average reduction in **NOX** emissions by $\mathbf{0.3761}$ mg/m3. **AT**, **AP** and **AH**, again, can be taken into account: the model prescribes that producing energy on a day with higher ambient temperature, pressure or humidity on average means lower **NOX** emissions. There are no outliers in this model, full robustness check was done in the appendix p.7. Cross validation (also in appendix p.7) suggested that on average the model misses the predictions by approximately $\mathbf{13.4\%}$ which is decent enough for this range of data.
+
+
+# 3. Low levels of TEY
+
+This section runs the same analysis that was done for high and mid-range **TEY**, hence some of the explanations are redundant. Please refer to section 1.
+
+```{r}
+datalow0 <- data |>
+  filter(TEY < 130)
+```
+
+## 3.1. Collinearity detection
+
+Below are the variables whose VIF goes beyond the benchmark of 10, and their corresponding VIF's
+
+```{r}
+modlow0 <- lm(NOX~.-CO,data = datalow0)
+datalow <- datalow0[-1258,]
+modlow <- lm(NOX~.-CO,data = datalow)
+vif_l <- VIF(modlow)
+vif_l1 <- vif_l[which(vif_l>10)]
+mkable(vif_l1)
+```
+
+Evidence suggests that **AT**, **GTEP**, **TIT**, **TAT**, **TEY**, and **CDP** are collinear. Below is the plot of their VIF's, with horizontal line at $VIF=10$ being the benchmark:
+
+```{r}
+vif_l <- as.data.frame(vif_l)
+vif_l$predictors <- rownames(vif_l)
+vifplot_l <- ggplot(vif_l, aes(x=predictors,y=vif_l))+geom_col(aes(fill=predictors))+geom_abline(intercept = 10, slope=0)
+vifplot_l + theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = rgb(red=100,green=100,blue=100, maxColorValue = 100)),
+axis.line = element_line(colour = "black"))+
+  ylab("VIF")+
+  coord_cartesian(ylim = c(0,150))+
+  ggtitle("VIF's of all predictors (TIT has VIF >> 150)")+scale_fill_brewer(palette="RdYlBu")
+```
+
+Here, the steps in finding the best model that are used before are irrelevant since one of the collinear variables is **TEY**. And it is crucial for us to find the model where **TEY** is not correlated with any other variables. So, it is reasonable to start removing other variables from the full model one by one. At each step the variable, removing which hurts the model the least (based on the same criterion as for mid-range), is removed.
+
+```{r, results='hide'}
+step(modlow,k=2,direction="backward")
+minus1low <- lm(NOX~.-CO-TAT,data = datalow) #remove TAT
+100*(AIC(modlow)-AIC(minus1low))/AIC(modlow) #worsening is 0.028%
+step(minus1low,k=2,direction="backward")
+
+minus2low <- lm(NOX~.-CO-TAT-AP,data = datalow) #remove AP
+100*(AIC(minus1low)-AIC(minus2low))/AIC(minus1low) #worsening is 0.019%
+step(minus2low,k=2,direction="backward")
+
+minus3low <- lm(NOX~.-CO-TAT-AP-TIT,data = datalow) #remove TIT
+100*(AIC(minus2low)-AIC(minus3low))/AIC(minus2low) #worsening is 0.214%
+step(minus3low,k=2,direction="backward")
+
+minus4low <- lm(NOX~.-CO-TAT-AP-TIT-CDP,data = datalow) #remove CDP
+100*(AIC(minus3low)-AIC(minus4low))/AIC(minus3low) #worsening is 0.319%
+step(minus4low,k=2,direction="backward")
+
+minus5low <- lm(NOX~.-CO-TAT-AP-TIT-CDP-GTEP,data = datalow) #remove GTEP
+100*(AIC(minus4low)-AIC(minus5low))/AIC(minus4low) #worsening is 3.127%
+step(minus5low,k=2,direction="backward")
+
+100*(AIC(modlow)-AIC(minus5low))/AIC(modlow) #total worsening is 3.726%
+```
+
+At the 1st step, removing **TAT** worsens the model by $0.028\%$, so, **TAT** is removed. At the 2nd step, **AFDP** is the one that should be romoved but it is the only tweakable variable left that is NOT collinear with **TEY**, so it cannot be removed. Eliminating **AP** results in the least worsening among the rest, namely $0.019\%$. At the 3rd step, eliminating **TIT** results in the least worsening, $0.214\%$, hence, it is removed. At the 4th step, eliminating **CDP** results in the least worsening, $0.319\%$, hence, it is removed. At the 5th step, we have to remove **GTEP** (otherwise due to collinearity we would not have any results), and removing it results in a pretty significant worsening of $3.127\%$. Total model worsening is $3.726\%$.
+
+Hence, the model that is chosen for the high-range **TEY** is:
+
+```{r}
+formula(minus5low)
+```
+
+And marginal effects of each variable on **NOX** is:
+
+```{r}
+mkable(round(coef(minus5low)[-c(1,5)],4))
+```
+
+Which means that keeping **TEY** fixed, a decrease of **AFDP** by 1 mbar is associated with an average reduction in **NOX** emissions by $\mathbf{1.12}$ mg/m3. **AT** and **AH**, again, can be taken into account: the model prescribes that producing energy on a day with higher ambient temperature, pressure or humidity on average means lower **NOX** emissions. There are no outliers in this model, full robustness check was done in the appendix p.8. The underlying issue of this final model (for low **TEY**) is that now **TEY** is not significantly different from 0. What's more is that the model was better off if it was removed, as well as **AFDP**, during steps 3 and 4 of the elimination. Which means that although the results exists, they are not very suggestive. In absence of **TEY** in the model, the. Cross validation (also in appendix p.8) suggested that on average the model misses the predictions by approximately $\mathbf{8.9\%}$ which is quite decent for this range of data, and better than for the high **TEY** data. We have to admit to a misinterpretation of given values during preparation of the presentation, where we claimed prediction error to be very high, which it apparently is not.
+
+# 4. Summary of the results
+
+In short:
+
+ 1. The suggestions of the model for mid-range data about how to reduce emissions while keeping **TEY** constant are trustworthy, and the model itself is good for predicting emissions given new hypothetical data.
+ 
+ 2. The suggestions of the model for high-range data about how to reduce emissions while keeping **TEY** constant are fairly trustworthy, and the model itself is okay for predicting emissions given new hypothetical data.
+ 
+ 2. The suggestions of the model for high-range data about how to reduce emissions while keeping **TEY** constant are not very trustworthy, but the model itself is quite decent for predicting emissions given new hypothetical data.
+
+More broadly:
+
+## 4.1 Mid-range data
+
+The final model for mid-range data suggests the following.
+
+ 1. Suggestions on how to reduce emissions while keeping TEY fixed:
+
+```{r, results='asis'}
+res_mid <- data.table()
+res_mid[,Measure:=names(coef(redmodmidnl11)[-c(1,5)])]
+res_mid[,"Direction of change (by 1 UoM)":=c("up","up","down")]
+res_mid[,"Interpretation":=c("produce on a warmer day","produce on a more humid day","decrease manually")]
+res_mid[,"Units of measurement (UoM)":=c("1ºC", "1%","1mbar")]
+res_mid[,"Associated decrease in NOX":=paste(abs(round(100*(exp(coef(redmodmidnl11)[-c(1,5)])-1),3)),"%")]
+
+kable(res_mid)
+```
+
+ 2. If used for predicting emissions using new hypothetical data, this final model on average gives the predictions that are inaccurate by about $\mathbf{4\%}$ of the actual value, which is extremely good
+ 
+ 3. In case of the non-reduced model, it cannot be used to make any suggestions but it is even better at predictions than the reduced one: its average prediction error is about $\mathbf{3.85\%}$.
+
+## 4.2 High levels of TEY
+
+The final model for high levels of **TEY** suggests the following.
+
+ 1. Suggestions on how to reduce emissions while keeping TEY fixed:
+
+```{r, results='asis'}
+res_high <- data.table()
+res_high[,Measure:=names(coef(minus4)[-c(1,6)])]
+res_high[,"Direction of change (by 1 UoM)":=c("up","up","up","down")]
+res_high[,"Interpretation":=c("produce on a warmer day","produce on a day with higher atmospheric pressure","produce on a more humid day","decrease manually")]
+res_high[,"Units of measurement (UoM)":=c("1ºC","1mbar","1%","1ºC")]
+res_high[,"Associated decrease in NOX":=paste(abs(round(coef(minus4)[-c(1,6)],3)),"mg/m3")]
+
+kable(res_high)
+```
+
+ 2. In **95%** of the most common values of emissions at this level of **TEY**, if used for predicting emissions using new hypothetical data, this model on average gives the predictions that are inaccurate by about $\mathbf{13.4\%}$ of the actual value, which is not great but acceptable for this type of model.
+ 
+## 4.3 Low levels of TEY
+
+The final model for low levels of **TEY** suggests the following.
+
+ 1. Suggestions on how to reduce emissions while keeping TEY fixed:
+
+```{r, results='asis'}
+res_low <- data.table()
+res_low[,Measure:=names(coef(minus4low)[-c(1,6)])]
+res_low[,"Direction of change (by 1 UoM)":=c("up","up","down","down")]
+res_low[,"Interpretation":=c("produce on a warmer day","produce on a more humid day","decrease manually","decrease manually")]
+res_low[,"Units of measurement (UoM)":=c("1ºC","1%","1mbar","1mbar")]
+res_low[,"Associated decrease in NOX":=paste(abs(round(coef(minus4low)[-c(1,6)],3)),"mg/m3")]
+
+kable(res_low)
+```
+
+ 2. The suggestions are not very trustworthy, and should be tested very carefully in practice, as their theoretical justification is not very strong.
+
+ 3. In **95%** of the most common values of emissions at this level of **TEY**, if used for predicting emissions using new hypothetical data, this model on average gives the predictions that are inaccurate by about $\mathbf{8.9\%}$ of the actual value, which is decent enough for this type of model.
+
+\newpage
+
+\LARGE 
+**Appendix**
+\normalsize
+
+&nbsp;
+
+## 1. Linear regression
+
+Assume our data is coming from the model $Y_i=\alpha+\beta_1X^{(1)}_i+ ...+\beta_pX^{(p)}_i+\epsilon_i ~, ~\ ~\ 1\leq i\leq n$, where $n$ is the number of observations, and for $i$-th observation, $Y_i$ and $\epsilon_i$ are the realizations of response variable and irreducible error respectively, $X_i^{(1)}...X_i^{(p)}$ are the values of $p$ different explanatory variables (or simply features).  Then for each $j \in (1,p)$, $\hat{\beta_j}$ is the $j$-th coordinate of the vector $(\alpha ~\ \hat{\beta_1} ~\ ... ~\ \hat{\beta_p})^T$ that minimizes the residual sum of squares. And $\hat{\beta_j}$ is interpreted as follows:
+
+Keeping all other variables fixed, an increase/decrease in $X_i^{(j)}$ by 1 unit of its measurement results on average in an increase/decrease of $Y_i$ by $\hat{\beta_j}$ units of its measurement.
+
+## 2. Variance inflation factor. 
+
+$VIF_j=\frac{1}{1-R^2_j}$, where $R^2_j$ is the percentage of variation in feature $j$ (or $X^{(j)}$), explained by all other features. The closer $R^2_j$ is to 1, the larger the $VIF_j$, so, benchmark $VIF_j\geq 10$ detects the ones with "too high" correlation (either positive or negative) with other variables.
+
+## 3. Mallow's $C_p$
+
+$C_p=RSS_p+2(p+1)-n=\sum_{i=1}^{n}(Y_i-\hat{Y_i}^{(p)})^2+2(p+1)-n$, where $\hat{Y_i}^{(p)}$ - fitted response variable when $p$ features are used. $C_p$ needs to be minimized with respect to $p$. The algorithm that is implemented in R tells which set of features minimizes this objective function.
+
+## 4. Normality and Homoskedasticity
+
+### 4.1. Outliers detection
+
+Cook's Distance is the measure used for detecting outliers. If it is smaller than 0.5 (rule-of-thumb benchmark) for all observations, there are no problems with outliers. Here, maximal Cook's distance among all observations is:
+
+```{r}
+max(cooks.distance(bestmodelmid))
+```
+
+Which means there are no outliers in the linear model.
+
+### 4.2. Homoskedasticity.
+ It is assumed that in the initial model, (from p.1) $$Var(\epsilon)=\sigma^2I_n ~\ \text{ , where } \sigma^2>0, ~ I_n-n\times n ~\ \text{identity matrix}$$
+In words, it means that the errors are uncorrelated and have the same variance. This is known as constant variance or homoskedasticity. When this assumption is violated, the problem is known as heteroskedasticity. The problem with heteroskedasticity is that without constant variance assumption, neither t-tests for individual significance nor F-tests for joint significance of any group of variables are valid and can be relied on. It happens due to the fact that by their construction, test statistics for those tests are distributed the way they are only under constant variance assumption.
+
+We use 2 diferent tests to detect Heteroskedasticity: White and Breusch-Pagan tests. They both test the same hypothesis (null - errors are uncorrelated and have constant variance, alternative - errors are correlated or have different variance). Below you can see p-values of each:
+
+```{r}
+wh <- white_lm(bestmodelmidnl)[[2]]
+bp <- bptest(bestmodelmidnl)[[4]]
+whbp <- c(wh,bp)
+names(whbp) <- c("White test", "Breusch-Pagan test")
+whbp
+```
+
+[$\texttt{Ae-B}:=A*10^{-B}$] Which means that both tests yield a p-value smaller than $0.001$, which presents us with extremely strong statistical evidence that heteroskedasticity is present.
+
+As a remedy for heteroskedasticity, robust (or heteroskedasticity consistent or White) standard errors [s.e.] are used instead of regular standard errors for individual significance t-tests, and Wald test (which takes into account robust s.e.) is used instead of regular F-test for joint significance.
+
+The p-values (rounded to the nearest 5th digit in its decimal representation) of t-tests for individual significance are presented below:
+
+```{r}
+mkable(round(coeftest(bestmodelmidnl, vcov = vcovHC(bestmodelmidnl, type = "HC0"))[-1,4],4))
+```
+
+And p-value of F-test for joint significance of the model is presented below:
+
+```{r}
+modelintercept <- lm(NOXnl~1,data = datamidnl)
+waldtest(bestmodelmidnl,modelintercept, vcov = vcovHC(bestmodelmidnl, type = "HC0"))[2,4]
+```
+
+From the two types of tests it can be seen that all of the feature coefficients (i.e., excluding intercept) are significant at at least $5\%$ level, presenting evidence that even if constant variance assumption is violated, the chosen model is extremely significant as a whole, with each of the chosen features strongly significant individually.
+
+&nbsp;
+ 
+### 4.3. Normality assumption.
+ Formally speaking, it is assumed that in the initial model, (from p.1) $$\epsilon=(\epsilon_1 ~\ ... ~\ \epsilon_n)^T \sim N(0,\sigma^2I_n) ~\ \text{ , where } \sigma^2>0, ~ I_n-n\times n ~\ \text{identity matrix}$$
+
+&nbsp;
+
+### 4.4. Shapiro-Wilk test:
+ null hypothesis is that the distribution of errors is in fact normal. An alternative hypothesis that the distribution of errors is not normal. 
+P-value of the test statistic for the linear model is shown below, and it is smaller than $0.001$, which presents some extremely strong statistical evidence that errors are in fact not distributed normally, and that some transformations of the response variable should be done. Below is the exact p-value:
+
+```{r}
+shapiro.test(resid(bestmodelmidnl))[[2]]
+```
+
+&nbsp;
+
+### 4.5. P-value of the test statistic for the model with \textbf{NOXnl}
+
+ - is shown below, and it is smaller than $0.001$, which presents some extremely strong statistical evidence that errors are in fact not distributed normally. However, now this evidence is weaker than it was for the fully linear model, and the normality assumption is more likely to be satisfied.
+ 
+```{r}
+0
+```
+
+## 5. Finding a transformation of the response variable
+
+### 5.1. Box-Cox transformation.
+It takes the response variable $\{Y_i\}_{i=1}^n$ and raises it to the power $\lambda$ element-wise, which means that the new response is $\{Y_i^{\lambda}\}_{i=1}^n$. After that, it maximizes the likelihood of the data, and gives the range of possible maximizers.
+
+```{r, fig.dim=c(5,4.5)}
+lambda_transformation <- boxcox(bestmodelmid, lambda = seq(-1, 5, length = 1000))
+```
+
+In our case the interval includes $\lambda=0$, in which case Box-Cox procedure prescribes to use $\text{ln}(Y)$ as the new response variable.
+
+### 5.2. Interpretation of the logarithm of the response variable.
+Given the model $\text{ln}(Y)=a+b\cdot X$, by our usual interpretation, $\Delta X=1$ is associated with $\Delta \text{ln}(Y)=b$.
+$$b=\Delta \text{ln}(Y)=\text{ln}(Y+\Delta Y)-\text{ln}(Y)=\text{ln}(\frac{Y+\Delta Y}{Y}) \Rightarrow \frac{Y+\Delta Y}{Y}=e^b$$
+So, interpretation of coefficients in the model $\text{ln}(Y_i)=\alpha+\beta_1X^{(1)}_i+ ...+\beta_pX^{(p)}_i+\epsilon_i$ is as follows:
+
+Keeping all other variables fixed, an increase/decrease in $X_i^{(j)}$ by 1 unit of its measurement results on average in an increase/decrease of $Y_i$ by $\text{exp}[\hat{\beta_j}]\times100\%$ percents.
+
+### 5.3. How well does the model perform as a whole?
+In order to assess how well the model predicts emissions given the data that was not in the initial sample, *cross validation* is used. There are different types of cross validation, but the one that was used for this model is 10-fold cross validation. Formal steps are presented below:
+
+1. Divide the whole set of observation into 10 samples of equal size, take the 1st one of those samples out
+
+2. Fit the model using all other samples: $\hat{Y}_{(1)}=X_{(1)}\hat{\beta}_{(1)}$
+
+3. Predict the value of **NOX** (Y in this case) of each observation in the left-out sample using the estimated model: $\hat{Y_i}=x^T_i\hat{\beta}_{(1)}, ~\ i \in (1,n_1)$
+
+4. Obtain prediction errors for each of those observations: $PE_i=\hat{Y_i}-Y_{i}, ~\ i \in (1,n_1)$
+
+5. Repeat steps 1-4 for all other samples
+
+6. Obtain performance statistics, e.g., $MAE=\frac{1}{n}\Sigma_{i=1}^n|PE_i|$, $RMSE=\sqrt{\frac{1}{n}\Sigma_{i=1}^nPE_i^2}$
+
+7. Assess them depending on the units of measurement of the response variable.
+
+Now, for the model in question these statistics are presented below:
+
+```{r}
+ctrl <- trainControl(method = "cv", number = 10)
+cv_modmid <- train(formula(bestmodelmidnl), data = datamidnl, method = "lm", trControl = ctrl)
+mkable(as.matrix(cv_modmid$results)[,c(2,4)])
+```
+
+Interpretation of RMSE and MAE is similar but MAE is easier to explain. MAE is $0.0378$, which means that on average log of predicted NOx emissions is different from the actual one by $0.0378$. Meaning that predicted NOx emissions on average differ from the actual ones by $(e^{0.0378}-1)\cdot 100\% \approx 3.85\%$, which is a very slight deviation.
+
+## 6. Reducing the model
+
+### 6.1. AIC, BIC and Mallow's $C_p$
+
+$$C_p=RSS_p+2(p+1)-n\\
+AIC=RSS_p+2(p+1)=C_p-n\\
+BIC=RSS_p+(p+1)\cdot\ln(n)$$
+
+### 6.2. Cross Validation for reduced model
+
+```{r}
+ctrl <- trainControl(method = "cv", number = 10)
+cv_redmodmid <- train(formula(redmodmidnl11), data = datamidnl, method = "lm", trControl = ctrl)
+mkable(as.matrix(cv_redmodmid$results)[,c(2,4)])
+```
+
+Again, by the same interpretation, predicted NOx emissions on average differ from the actual ones by $(e^{0.0392}-1)\cdot 100\% \approx 4.00\%$, which is still very small deviation, albeit the model now has worsened by $\approx 3.70 \%$.
+
+```{r, results='hide'}
+# round(abs(100*((exp(0.0378)-1)*100-(exp(0.0392)-1)*100)/((exp(0.0378)-1)*100)),2)
+```
+
+```{r, echo=TRUE}
+round(abs(100*(0.0378-0.0392)/0.0378),2)
+```
+
+### 6.3. Robustness checks for reduced model
+
+Maximal Cook's Distance (outlier detection) is $0.036<0.5 \Rightarrow$ no outliers are detected:
+
+```{r}
+max(cooks.distance(redmodmidnl11))
+```
+
+P-values of White and Breusch-Pagan tests for heteroskedasticity detection:
+
+```{r}
+whred <- white_lm(redmodmidnl11)[[2]]
+bpred <- bptest(redmodmidnl11)[[4]]
+whbpred <- c(whred,bpred)
+names(whbpred) <- c("White test", "Breusch-Pagan test")
+whbpred
+```
+
+Compared with the p-values for the non-reduced model:
+
+```{r}
+whbp
+```
+
+P-value of Shapiro-Wilk test for the reduced model:
+
+```{r}
+shapiro.test(resid(redmodmidnl11))[[2]]
+```
+
+Compared with the p-value for the non-reduced model:
+
+```{r}
+shapiro.test(resid(bestmodelmidnl))[[2]]
+```
+
+Hence, overall, the model is less homoskedastic but errors are more likely normally distributed.
+
+The p-values (rounded to the nearest 5th digit in its decimal representation) of t-tests for individual significance using are presented below:
+
+```{r}
+mkable(round(coeftest(redmodmidnl11, vcov = vcovHC(redmodmidnl11, type = "HC0"))[-1,4],5))
+```
+
+And p-value of F-test for joint significance of the model is presented below:
+
+```{r}
+waldtest(redmodmidnl11,modelintercept, vcov = vcovHC(redmodmidnl11, type = "HC0"))[2,4]
+```
+
+Which presents us with very strong statistical evidence that the chosen features are significant individually, and that the model is significant as a whole.
+
+## 7. Robustness checks and cross validation for high level model
+
+### 7.1. Outliers
+
+Maximal cook's distance is less than 0.5 which means there are no outliers in the model:
+
+```{r}
+max(cooks.distance(minus4))
+```
+
+### 7.2 Normality and heteroskedasticity
+
+P-values of White and Breusch-Pagan tests for heteroskedasticity detection:
+
+```{r}
+whh <- white_lm(minus4)[[2]]
+bph <- bptest(minus4)[[4]]
+whbph <- c(whh,bph)
+names(whbph) <- c("White test", "Breusch-Pagan test")
+whbph
+```
+
+Compared with the p-values for the reduced mid-range model:
+
+```{r}
+whbpred
+```
+
+Means that there is a weaker case for heteroskedasticity for high-TEY data
+
+P-value of Shapiro-Wilk test for the reduced model:
+
+```{r}
+shapiro.test(resid(minus4))[[2]]
+```
+
+Compared with the p-value for the reduced mid-range model:
+
+```{r}
+shapiro.test(resid(redmodmidnl11))[[2]]
+```
+
+Hence, overall, the model is more homoskedastic but errors are less likely normally distributed.
+
+The p-values (rounded to the nearest 5th digit in its decimal representation) of t-tests for individual significance using are presented below:
+
+```{r}
+mkable(round(coeftest(minus4, vcov = vcovHC(minus4, type = "HC0"))[-1,1],5))
+```
+
+And p-value of F-test for joint significance of the model is presented below:
+
+```{r}
+modelintercepth <- lm(NOX~1, data = datahigh)
+round(waldtest(minus4,modelintercepth, vcov = vcovHC(minus4, type = "HC0"))[2,4],306)
+```
+
+Which presents us with very strong statistical evidence that the chosen features are significant individually, and that the model is significant as a whole.
+
+### 7.3 Cross validation
+
+```{r}
+cv_modhigh <- train(formula(minus4), data = datahigh, method = "lm", trControl = ctrl)
+mkable(as.matrix(cv_modhigh$results)[,c(2,4)])
+```
+
+$MAE\approx 3.2$, which means that $|\hat{NOX}-NOX|\approx 3.2$
+
+Since 95% of the values of NOX lie within $57.5$ and $81.4$, which is a range of length $23.9$, that average deviation is $3.2/23.9\approx 0.134$ or $13.4\%$. Which is not very small but not very large either.
+
+```{r}
+# paste(quantile(datahigh$NOX,0.05),quantile(datahigh$NOX,0.95))
+# -quantile(datahigh$NOX,0.05)+quantile(datahigh$NOX,0.95)
+# mkable(as.matrix(cv_modhigh$results)[,4]/(-quantile(datahigh$NOX,0.05)+quantile(datahigh$NOX,0.95)))
+```
+
+## 8. Robustness checks and cross validation for high level model
+
+### 8.1. Outliers
+
+In the model that has not been reduced yet, Cook's distance is higher than 0.5 for 1 observation (\#1258), which means it is likely an outlier and should be removed:
+
+```{r}
+as.numeric(which(cooks.distance(modlow0)>0.5))
+```
+
+So, no outliers are left in the reduced model.
+
+### 8.2 Normality and heteroskedasticity
+
+P-values of White and Breusch-Pagan tests for heteroskedasticity detection:
+
+```{r}
+whl <- white_lm(minus5low)[[2]]
+bpl <- bptest(minus5low)[[4]]
+whbpl <- c(whl,bpl)
+names(whbpl) <- c("White test", "Breusch-Pagan test")
+whbpl
+```
+
+Compared with the p-values for the reduced mid-range model:
+
+```{r}
+whbpred
+```
+
+Means that there is a weaker case for heteroskedasticity for low-TEY data
+
+P-value of Shapiro-Wilk test for the low-TEY model:
+
+```{r}
+shapiro.test(resid(minus4low))[[2]]
+```
+
+Compared with the p-value for the reduced mid-range model:
+
+```{r}
+shapiro.test(resid(redmodmidnl11))[[2]]
+```
+
+Hence, overall, the model is less homoskedastic but errors are more likely normally distributed.
+
+The p-values (rounded to the nearest 5th digit in its decimal representation) of t-tests for individual significance using are presented below:
+
+```{r}
+mkable(round(coeftest(minus4, vcov = vcovHC(minus4, type = "HC0"))[-1,1],5))
+```
+
+And p-value of F-test for joint significance of the model is presented below:
+
+```{r}
+modelintercepth <- lm(NOX~1, data = datahigh)
+round(waldtest(minus4,modelintercepth, vcov = vcovHC(minus4, type = "HC0"))[2,4],306)
+```
+
+Which presents us with very strong statistical evidence that the chosen features are significant individually, and that the model is significant as a whole.
+
+### 8.3. Cross validation
+
+```{r}
+cv_modlow <- train(formula(minus4low), data = datalow, method = "lm", trControl = ctrl)
+mkable(as.matrix(cv_modlow$results)[,c(2,4)])
+```
+
+$MAE\approx 4.6$ which means that $|\hat{NOX}-NOX|\approx 4.6$
+
+Since 95% of the values of NOX lie within $50.32$ and $101.86$, which is a range of length $51.54$, that average deviation is $4.59/51.54.\approx 0.089$ or $8.9\%$. Which is quite small.
+
+```{r}
+# paste(quantile(datalow$NOX,0.05),quantile(datalow$NOX,0.95))
+# -quantile(datalow$NOX,0.05)+quantile(datalow$NOX,0.95)
+# as.matrix(cv_modlow$results)[,4]/(-quantile(datalow$NOX,0.05)+quantile(datalow$NOX,0.95))
+```
+
+<!-- \newpage -->
+
+<!-- # Contributions -->
+
+<!-- Everyone contributed the same amount to the cause. -->
+
+
+
